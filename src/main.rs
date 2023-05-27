@@ -50,7 +50,7 @@ fn parse_args() -> Result<GlobalArguments, lexopt::Error> {
     let mut domain = None;
     let mut password = None;
     let mut process_path = None;
-    let mut other_arguments = None;
+    let mut other_arguments = vec![];
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
@@ -60,15 +60,13 @@ fn parse_args() -> Result<GlobalArguments, lexopt::Error> {
                 println!(HELP!(), bin_name = bin_name);
                 std::process::exit(0);
             }
-            Long("username") if other_arguments.is_none() => username = Some(parser.value()?),
-            Long("domain") if other_arguments.is_none() => domain = Some(parser.value()?),
-            Long("password") if other_arguments.is_none() => password = Some(parser.value()?),
-            Long("") if other_arguments.is_none() => {
-                other_arguments = Some(parser.values()?.collect())
-            }
+            Long("username") => username = Some(parser.value()?),
+            Long("domain") => domain = Some(parser.value()?),
+            Long("password") => password = Some(parser.value()?),
             Value(path) if process_path.is_none() => {
                 process_path = Some(path.into());
             }
+            Value(argument) if process_path.is_some() => other_arguments.push(argument),
             _ => return Err(arg.unexpected()),
         }
     }
@@ -78,7 +76,7 @@ fn parse_args() -> Result<GlobalArguments, lexopt::Error> {
         domain: domain,
         password: password.ok_or("Missing option password")?,
         process_path: process_path.ok_or("Missing argument ProcessPath")?,
-        process_arguments: other_arguments.unwrap_or(vec![]),
+        process_arguments: other_arguments,
     })
 }
 
