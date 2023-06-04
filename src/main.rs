@@ -13,14 +13,20 @@ use windows::{
     Win32::Foundation::*,
     Win32::Security::*,
     Win32::System::{
-        Memory::{LocalAlloc, LPTR},
-        StationsAndDesktops::*,
-    },
-    Win32::System::{
         RemoteDesktop::*,
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
+    Win32::{
+        System::{
+            Memory::{LocalAlloc, LPTR},
+            StationsAndDesktops::*,
+        },
+        UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE},
+    },
 };
+
+mod google_crossvm;
+use google_crossvm::*;
 
 macro_rules! HELP {
     () => {
@@ -61,61 +67,6 @@ struct GlobalArguments {
     process_arguments: Vec<OsString>,
     //
     interactive: bool,
-}
-
-struct HeapWrapped<Type> {
-    data: *mut Type,
-    allocation_layout: Layout,
-}
-
-impl<Type> HeapWrapped<Type> {
-    fn new(allocation_layout: Layout) -> anyhow::Result<Self> {
-        ensure!(
-            allocation_layout.size() > 0,
-            "Failed to create valid layout"
-        );
-
-        // SAFETY; Allocation size is greater than 0
-        let data = unsafe { alloc_zeroed(allocation_layout) } as *mut Type;
-        if data.is_null() {
-            handle_alloc_error(allocation_layout);
-        }
-
-        Ok(HeapWrapped {
-            data,
-            allocation_layout,
-        })
-    }
-}
-
-impl<Type> AsRef<Type> for HeapWrapped<Type> {
-    fn as_ref(&self) -> &Type {
-        // SAFETY; Constructor enforced following pointer details
-        // - Size > 0
-        // - Proper aligment
-        // - Dereferenceable
-        // SAFETY; Is the pointed to data a valid TYPE?
-        unsafe { &*self.data }
-    }
-}
-
-impl<Type> AsMut<Type> for HeapWrapped<Type> {
-    fn as_mut(&mut self) -> &mut Type {
-        // SAFETY; Constructor enforced following pointer details
-        // - Size > 0
-        // - Proper aligment
-        // - Dereferenceable
-        // SAFETY; Is the pointed to data a valid TYPE?
-        unsafe { &mut *self.data }
-    }
-}
-
-impl<Type> Drop for HeapWrapped<Type> {
-    fn drop(&mut self) {
-        // SAFETY; The pointed to buffer is valid, enforced in the constructor, and we're
-        // using the same layout from the creation call.
-        unsafe { dealloc(self.data.cast(), self.allocation_layout) }
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -177,97 +128,60 @@ unsafe fn entrypoint_slave_dacl(args: &GlobalArguments) -> anyhow::Result<()> {
     todo!()
 }
 
-unsafe fn entrypoint_launch(args: &GlobalArguments) -> anyhow::Result<()> {
-    precondition_account_localsystem()?;
+fn entrypoint_launch(args: &GlobalArguments) -> anyhow::Result<()> {
+    let user_token = Token::new_for_process()?;
+    let user_token = TokenInformation::<TOKEN_USER>::new(user_token)?;
+
+    // TODO; Loosen this requirement and try to elevate into the required permission
+    precondition_account_localsystem(&user_token.as_ref().User.Sid)?;
+
+    
+
+    // let access_token = get_target_user_accesstoken(args)?;
+    // let appdata_known_folder: GUID = "F1B32785-6FBA-4FCF-9D55-7B8E7F157091".into();
+    // let Token::Handle(access_token) = access_token else { unreachable!(); };
+    // unsafe {
+    //     let appdata_folder_path =
+    //         SHGetKnownFolderPath(addr_of!(appdata_known_folder), KF_FLAG_CREATE, access_token)?;
+    // }
+
     Ok(())
 }
 
-// SAFETY; Return the TOKEN_USER struct because the SID deallocates when that struct goes out of scope.
-fn get_current_user_token() -> anyhow::Result<impl AsRef<TOKEN_USER>> {
-    let token_current_process = {
-        let mut token = HANDLE::default();
-        unsafe {
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
-        }
-        token
-    };
-
-    // WARN; Idiomatic use of GetTokenInformation requires us to call the method twice.
-    // The first time is to retrieve how many bytes we need to allocate for the requested data.
-    // The second time to retrieve the actual data. This second call could still fail if the allocated size isn't large enough.
-    let mut bytes_required = 0;
-    unsafe {
-        // WARN; We expect this method to return failure, so we consume the result and assert bytes_required below.
-        let _ = GetTokenInformation(
-            token_current_process,
-            TokenUser,
-            None,
-            0,
-            &mut bytes_required,
-        );
-    }
-
-    ensure!(
-        bytes_required > 0,
-        "Unable to get the size of the token information"
-    );
-
-    // WARN; Dynamically allocate the required size because mem::zeroed() is not a general purpose idiomatic solution (and sets a bad example).
-    // NOTE; Alignment is set to the platform pointer size because I have no better guess. This value is restricted by Layout requirements as well.
-    let allocation_layout =
-        Layout::from_size_align(bytes_required as _, size_of::<*const c_void>())?;
-    let buffer = HeapWrapped::<TOKEN_USER>::new(allocation_layout)?;
-
-    unsafe {
-        GetTokenInformation(
-            token_current_process,
-            TokenUser,
-            // SAFETY; buffer.data will be provided a valid TOKEN_USER struct
-            Some(buffer.data.cast()),
-            bytes_required,
-            &mut bytes_required,
-        )
-        .ok()?;
-    }
-
-    Ok(buffer)
-}
-
-fn get_local_system_sid() -> anyhow::Result<PSID> {
-    const SECURITY_LOCAL_SYSTEM_RID: u32 = 18;
-    let mut sessionid_localsystem = PSID::default();
-    unsafe {
-        AllocateAndInitializeSid(
-            &SECURITY_NT_AUTHORITY,
-            1,
-            SECURITY_LOCAL_SYSTEM_RID,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            &mut sessionid_localsystem,
-        )
-        .ok()?;
-    }
-    Ok(sessionid_localsystem)
-}
-
-unsafe fn precondition_account_localsystem() -> anyhow::Result<()> {
-    let current_user_sid = get_current_user_token()?.as_ref().User.Sid;
+fn precondition_account_localsystem(current_user_sid: &PSID) -> anyhow::Result<()> {
     // TODO; Wrap allocated SID object into cleanup type.
-    let system_sid = get_local_system_sid()?;
-    let comparison = EqualSid(current_user_sid, system_sid)
-        .ok()
-        .map_err(|_| anyhow!("The process owner is not LOCAL_SYSTEM"));
-    FreeSid(system_sid);
+    let system_sid = {
+        const SECURITY_LOCAL_SYSTEM_RID: u32 = 18;
+        let mut identifier = PSID::default();
+        unsafe {
+            AllocateAndInitializeSid(
+                &SECURITY_NT_AUTHORITY,
+                1,
+                SECURITY_LOCAL_SYSTEM_RID,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &mut identifier,
+            )
+            .ok()?;
+        }
+        identifier
+    };
+    let comparison = unsafe {
+        EqualSid(current_user_sid.clone(), system_sid)
+            .ok()
+            .map_err(|_| anyhow!("The process owner is not LOCAL_SYSTEM"))
+    };
+    unsafe { _ = FreeSid(system_sid) };
 
     return comparison;
 }
 
-unsafe fn start_interactive_client_process(args: &GlobalArguments) -> anyhow::Result<()> {
+fn get_target_user_accesstoken(args: &GlobalArguments) -> anyhow::Result<Token> {
     let username = args
         .username
         .as_os_str()
@@ -289,21 +203,28 @@ unsafe fn start_interactive_client_process(args: &GlobalArguments) -> anyhow::Re
         .chain(Some(0))
         .collect::<Vec<_>>();
 
-    let mut token_target_user = HANDLE::default();
-    LogonUserW(
-        PCWSTR::from_raw(username.as_ptr()),
-        domain
-            // SAFETY; Reference to stack variable required! Otherwise we'd drop our vector at the end of the first map function scope!
-            .as_ref()
-            .map(|data| PCWSTR::from_raw(data.as_ptr()))
-            .unwrap_or(PCWSTR::null()),
-        PCWSTR::from_raw(password.as_ptr()),
-        LOGON32_LOGON_INTERACTIVE,
-        LOGON32_PROVIDER_DEFAULT,
-        &mut token_target_user,
-    )
-    .ok()?;
+    let token_target_user = unsafe {
+        let mut token = HANDLE::default();
+        LogonUserW(
+            PCWSTR::from_raw(username.as_ptr()),
+            domain
+                // SAFETY; Reference to stack variable required! Otherwise we'd drop our vector at the end of the first map function scope!
+                .as_ref()
+                .map(|data| PCWSTR::from_raw(data.as_ptr()))
+                .unwrap_or(PCWSTR::null()),
+            PCWSTR::from_raw(password.as_ptr()),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+        .ok()?;
+        Token::Handle(token)
+    };
 
+    Ok(token_target_user)
+}
+
+unsafe fn start_interactive_client_process(args: &GlobalArguments) -> anyhow::Result<()> {
     let id_session_console = WTSGetActiveConsoleSessionId();
     SetTokenInformation(
         token_target_user,
