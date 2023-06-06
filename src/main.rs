@@ -4,24 +4,28 @@ use std::{
     mem::{size_of, size_of_val},
     os::windows::prelude::OsStrExt,
     path::PathBuf,
-    ptr::addr_of,
+    ptr::{addr_of, addr_of_mut},
 };
 
 use anyhow::{anyhow, ensure, Context};
+use log::trace;
 use windows::{
     core::*,
     Win32::Foundation::*,
     Win32::Security::*,
-    Win32::System::{
-        RemoteDesktop::*,
-        Threading::{GetCurrentProcess, OpenProcessToken},
-    },
     Win32::{
         System::{
             Memory::{LocalAlloc, LPTR},
             StationsAndDesktops::*,
         },
         UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE},
+    },
+    Win32::{
+        System::{
+            RemoteDesktop::*,
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+        UI::Shell::{LoadUserProfileW, PROFILEINFOW},
     },
 };
 
@@ -129,13 +133,45 @@ unsafe fn entrypoint_slave_dacl(args: &GlobalArguments) -> anyhow::Result<()> {
 }
 
 fn entrypoint_launch(args: &GlobalArguments) -> anyhow::Result<()> {
-    let user_token = Token::new_for_process()?;
-    let user_token = TokenInformation::<TOKEN_USER>::new(user_token)?;
-
+    trace!("Check required access permissions");
+    let process_access_token = Token::new_for_process()?;
+    let process_token_information = TokenInformation::<TOKEN_USER>::new(process_access_token)?;
     // TODO; Loosen this requirement and try to elevate into the required permission
-    precondition_account_localsystem(&user_token.as_ref().User.Sid)?;
+    precondition_account_localsystem(&process_token_information.as_ref().User.Sid)?;
 
-    
+    let mut logon_access_token = logon_target_user(args)?;
+
+    // TODO; Fail if the target user has a roaming profile!
+
+    trace!("Load the user profile data");
+    let mut profile_info = PROFILEINFOW::default();
+    profile_info.dwSize = size_of::<PROFILEINFOW>() as u32;
+    profile_info.lpUserName = {
+        let username = args
+            .username
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+            .as_mut_ptr();
+        PWSTR::from_raw(username)
+    };
+    unsafe {
+        LoadUserProfileW(
+            unsafe { logon_access_token.get().clone() },
+            addr_of_mut!(profile_info),
+        )
+        .ok()?;
+    }
+
+    trace!("Resolve the path for temporary storage");
+    let guid_localappdatalow = GUID::from("A520A1A4-1780-4FF6-BD18-167343C5AF16");
+    let path_localappdatalow = unsafe {
+        SHGetKnownFolderPath(addr_of!(guid_localappdatalow), KF_FLAG_CREATE, unsafe {
+            logon_access_token.get().clone()
+        })?
+    };
+
+
 
     // let access_token = get_target_user_accesstoken(args)?;
     // let appdata_known_folder: GUID = "F1B32785-6FBA-4FCF-9D55-7B8E7F157091".into();
@@ -181,32 +217,30 @@ fn precondition_account_localsystem(current_user_sid: &PSID) -> anyhow::Result<(
     return comparison;
 }
 
-fn get_target_user_accesstoken(args: &GlobalArguments) -> anyhow::Result<Token> {
+fn logon_target_user(args: &GlobalArguments) -> anyhow::Result<Token> {
     let username = args
         .username
-        .as_os_str()
         .encode_wide()
         .chain(Some(0))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+        .as_ptr();
     // TODO; Document that non-provided domain requires username to include domain part. For local users, provide '.' as domain.
     let domain = args.domain.as_ref().map(|domain_value| {
         domain_value
-            .as_os_str()
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>()
     });
     let password = args
         .password
-        .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
 
-    let token_target_user = unsafe {
-        let mut token = HANDLE::default();
+    let mut access_token = HANDLE::default();
+    unsafe {
         LogonUserW(
-            PCWSTR::from_raw(username.as_ptr()),
+            PCWSTR::from_raw(username),
             domain
                 // SAFETY; Reference to stack variable required! Otherwise we'd drop our vector at the end of the first map function scope!
                 .as_ref()
@@ -215,13 +249,11 @@ fn get_target_user_accesstoken(args: &GlobalArguments) -> anyhow::Result<Token> 
             PCWSTR::from_raw(password.as_ptr()),
             LOGON32_LOGON_INTERACTIVE,
             LOGON32_PROVIDER_DEFAULT,
-            &mut token,
+            &mut access_token,
         )
-        .ok()?;
-        Token::Handle(token)
+        .ok()?
     };
-
-    Ok(token_target_user)
+    return unsafe { Token::new_from_raw(access_token) };
 }
 
 unsafe fn start_interactive_client_process(args: &GlobalArguments) -> anyhow::Result<()> {

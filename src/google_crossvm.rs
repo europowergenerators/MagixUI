@@ -47,7 +47,7 @@ pub struct TokenInformation<T> {
 
 impl<T: TokenClass> TokenInformation<T> {
     pub fn new(mut token: Token) -> anyhow::Result<Self> {
-        let token_handle = token.get();
+        let token_handle = unsafe { token.get() };
         // Retrieve the size of the struct.
         let mut size: u32 = 0;
         // Safe because size is valid, and TokenInformation is optional and allowed to be null.
@@ -56,7 +56,7 @@ impl<T: TokenClass> TokenInformation<T> {
             // to the function: the first to get the length of the data that the
             // function would return, and the second to fetch the data.
             GetTokenInformation(
-                /* TokenHandle= */ token_handle,
+                /* TokenHandle= */ token_handle.clone(),
                 /* TokenInformationClass= */ T::class(),
                 /* TokenInformation= */ None,
                 /* TokenInformationLength= */ 0,
@@ -94,12 +94,12 @@ impl<T: TokenClass> TokenInformation<T> {
             handle_alloc_error(layout);
         }
 
-        let token_info = TokenInformation::<T> { token_info, layout };
+        let mut token_info = TokenInformation::<T> { token_info, layout };
 
         // Safe because token_user and size are valid.
         unsafe {
             GetTokenInformation(
-                /* TokenHandle= */ token_handle,
+                /* TokenHandle= */ token_handle.clone(),
                 /* TokenInformationClass= */ T::class(),
                 /* TokenInformation= */ Some(addr_of_mut!(token_info.token_info).cast()),
                 /* TokenInformationLength= */ size,
@@ -145,6 +145,10 @@ pub struct Token {
 }
 
 impl Token {
+    pub unsafe fn new_from_raw(token: HANDLE) -> anyhow::Result<Self> {
+        Ok(Token { token })
+    }
+
     /// Open the current process's token.
     pub fn new_for_process() -> anyhow::Result<Self> {
         // Safe because GetCurrentProcess is an alias for -1.
@@ -185,8 +189,8 @@ impl Token {
         Ok(Token { token })
     }
 
-    fn get(&mut self) -> HANDLE {
-        self.token
+    pub unsafe fn get(&mut self) -> &mut HANDLE {
+        &mut self.token
     }
 }
 
