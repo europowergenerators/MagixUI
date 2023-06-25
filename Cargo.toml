@@ -5,6 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+# Autodiscover
+
+[[bin]]
+name = "magix-hide"
+test = false
+bench = false
+
 [dependencies]
 log = "0.4"
 lexopt = "0.3.0"
